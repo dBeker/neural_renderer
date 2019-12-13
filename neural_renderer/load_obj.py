@@ -1,9 +1,12 @@
 import os
-import string
 
-import chainer
+import neural_renderer.cuda.load_textures as load_textures_cuda
 import numpy as np
 import skimage.io
+import torch
+
+texture_wrapping_dict = {'REPEAT': 0, 'MIRRORED_REPEAT': 1,
+                         'CLAMP_TO_EDGE': 2, 'CLAMP_TO_BORDER': 3}
 
 
 def load_mtl(filename_mtl):
@@ -22,7 +25,7 @@ def load_mtl(filename_mtl):
     return colors, texture_filenames
 
 
-def load_textures(filename_obj, filename_mtl, texture_size):
+def load_textures(filename_obj, filename_mtl, texture_size, texture_wrapping='REPEAT', use_bilinear=True):
     # load vertices
     vertices = []
     for line in open(filename_obj).readlines():
@@ -61,18 +64,18 @@ def load_textures(filename_obj, filename_mtl, texture_size):
             material_name = line.split()[1]
     faces = np.vstack(faces).astype('int32') - 1
     faces = vertices[faces]
-    faces = chainer.cuda.to_gpu(faces)
+    faces = torch.as_tensor(faces).cuda()
     faces[1 < faces] = faces[1 < faces] % 1
 
     #
     colors, texture_filenames = load_mtl(filename_mtl)
 
     textures = np.zeros((faces.shape[0], texture_size, texture_size, texture_size, 3), 'float32') + 0.5
-    textures = chainer.cuda.to_gpu(textures)
+    textures = torch.as_tensor(textures).cuda()
 
     #
     for material_name, color in colors.items():
-        color = chainer.cuda.to_gpu(color)
+        color = torch.as_tensor(color).cuda()
         for i, material_name_f in enumerate(material_names):
             if material_name == material_name_f:
                 textures[i, :, :, :, :] = color[None, None, None, :]
@@ -81,67 +84,15 @@ def load_textures(filename_obj, filename_mtl, texture_size):
     for material_name, filename_texture in texture_filenames.items():
         filename_texture = os.path.join(os.path.dirname(filename_obj), filename_texture)
         image = skimage.io.imread(filename_texture).astype('float32') / 255.
-        image = chainer.cuda.to_gpu(image)
+        image = torch.as_tensor(image).cuda()
         image = image[::-1, ::1]
         is_update = np.array(material_names) == material_name
-        is_update = chainer.cuda.to_gpu(is_update).astype('int32')
+        is_update = torch.as_tensor(is_update).type(torch.int32).cuda()
 
-        loop = np.arange(textures.size / 3).astype('int32')
-        loop = chainer.cuda.to_gpu(loop)
-        chainer.cuda.elementwise(
-            'int32 j, raw float32 image, raw float32 faces, raw float32 textures, raw int32 is_update',
-            '',
-            string.Template('''
-                const int ts = ${texture_size};
-                const int fn = i / (ts * ts * ts);
-                float dim0 = ((i / (ts * ts)) % ts) / (ts - 1.) ;
-                float dim1 = ((i / ts) % ts) / (ts - 1.);
-                float dim2 = (i % ts) / (ts - 1.);
-
-                // sum(dim[k]) -> 1
-                float sum = dim0 + dim1 + dim2;
-                dim0 /= sum;
-                dim1 /= sum;
-                dim2 /= sum;
-
-                float* face = (float*)&faces[fn * 3 * 2];
-                float* texture = (float*)&textures[i * 3];
-                if (is_update[fn] == 0) return;
-
-                const float pos_x = (
-                    (face[2 * 0 + 0] * dim0 + face[2 * 1 + 0] * dim1 + face[2 * 2 + 0] * dim2) * (${image_width} - 1));
-                const float pos_y = (
-                    (face[2 * 0 + 1] * dim0 + face[2 * 1 + 1] * dim1 + face[2 * 2 + 1] * dim2) * (${image_height} - 1));
-                if (1) {
-                    /* bilinear sampling */
-                    const float weight_x1 = pos_x - (int)pos_x;
-                    const float weight_x0 = 1 - weight_x1;
-                    const float weight_y1 = pos_y - (int)pos_y;
-                    const float weight_y0 = 1 - weight_y1;
-                    for (int k = 0; k < 3; k++) {
-                        float c = 0;
-                        c += image[((int)pos_y * ${image_width} + (int)pos_x) * 3 + k] * (weight_x0 * weight_y0);
-                        c += image[((int)(pos_y + 1) * ${image_width} + (int)pos_x) * 3 + k] * (weight_x0 * weight_y1);
-                        c += image[((int)pos_y * ${image_width} + ((int)pos_x) + 1) * 3 + k] * (weight_x1 * weight_y0);
-                        c += image[((int)(pos_y + 1)* ${image_width} + ((int)pos_x) + 1) * 3 + k] * (weight_x1 * weight_y1);
-                        texture[k] = c;
-                    }
-                } else {
-                    /* nearest neighbor */
-                    const int pos_xi = round(pos_x);
-                    const int pos_yi = round(pos_y);
-                    for (int k = 0; k < 3; k++) {
-                        texture[k] = image[(pos_yi * ${image_width} + pos_xi) * 3 + k];
-                    }
-                }
-            ''').substitute(
-                texture_size=texture_size,
-                image_height=image.shape[0],
-                image_width=image.shape[1],
-            ),
-            'function',
-        )(loop, image, faces, textures, is_update)
-    return textures.get()
+        textures = load_textures_cuda.load_textures(image, faces, textures, is_update,
+                                                    texture_wrapping_dict[texture_wrapping],
+                                                    use_bilinear)
+    return textures.cpu().numpy()
 
 
 def load_obj(filename_obj, normalization=True, texture_size=4, load_texture=False):
@@ -191,7 +142,11 @@ def load_obj(filename_obj, normalization=True, texture_size=4, load_texture=Fals
         vertices *= 2
         vertices -= vertices.max(0)[None, :] / 2
 
+    vertices = torch.as_tensor(vertices).cuda()
+    faces = torch.as_tensor(faces).cuda()
+
     if load_texture:
+        textures = torch.as_tensor(textures).cuda()
         return vertices, faces, textures
     else:
         return vertices, faces
